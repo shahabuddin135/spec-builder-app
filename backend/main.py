@@ -1,9 +1,8 @@
-"""FastAPI app: CORS, routers, SSE endpoint, exception handlers.
+"""FastAPI app: spec generator + reviewer.
 
-Flow (spec: requirements.md §5, §10): upload -> analyze (Analyst->Strategist, in the
-background, streaming events) -> refine (bounded 3) / feedback (self-learning) ->
-generate-specs (Spec-Writer) -> download. UI transitions are driven by /events.
-No auth (PoC); security rests on the controls in security.py + SECURITY.md.
+Flow: upload brief -> analyze (parse + clarifying questions) -> generate-specs
+(answers -> full package) -> refine (request changes -> regenerate) -> download
+specs.zip. UI transitions are driven by SSE events, not POST returns. No auth (PoC).
 """
 from __future__ import annotations
 
@@ -11,7 +10,6 @@ import asyncio
 import hashlib
 import logging
 import uuid
-
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile
@@ -21,25 +19,20 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import select
 
-from backend import learning, models_db, security
+from backend import models_db, security, specgen
 from backend.agents.analyst import run_analyst
-from backend.agents.specwriter import run_specwriter
-from backend.agents.strategist import run_strategist
-from backend.config import MAX_REFINE_ITERATIONS, get_settings
+from backend.agents.clarifier import run_clarifier
+from backend.agents.planner import run_planner
+from backend.config import MAX_SPEC_REVISIONS, get_settings
 from backend.db import SessionLocal, init_db
 from backend.events import bus, event_stream
 from backend.schemas import (
     AnalyzeReq,
     AnalyzeResp,
-    BrandCard,
-    FeatureCard,
-    FeedbackReq,
-    GenerateSpecsReq,
+    GenerateReq,
+    GenerateResp,
+    ProjectBrief,
     RefineReq,
-    RefineResp,
-    SpecFile,
-    SpecResp,
-    Suggestion,
     UploadResp,
 )
 
@@ -47,7 +40,6 @@ log = logging.getLogger("main")
 settings = get_settings()
 limiter = security.limiter
 
-# Strong refs to background tasks so they aren't garbage-collected mid-run.
 _bg_tasks: set[asyncio.Task] = set()
 
 
@@ -57,8 +49,13 @@ def _spawn(coro) -> None:
     task.add_done_callback(_bg_tasks.discard)
 
 
-def _dump_items(items: list[Suggestion]) -> list[dict]:
-    return [s.model_dump(mode="json") for s in items]
+def _qa_pairs(analysis: models_db.Analysis) -> list[tuple[str, str]]:
+    qmap = {q.get("id", ""): q.get("question", "") for q in (analysis.questions or [])}
+    pairs: list[tuple[str, str]] = []
+    for a in analysis.answers or []:
+        qid = a.get("id", "")
+        pairs.append((qmap.get(qid, qid), a.get("answer", "")))
+    return pairs
 
 
 @asynccontextmanager
@@ -67,7 +64,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Marketing Strategy Spec Generator", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="SpecForge — Spec Generator", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,78 +84,82 @@ async def _unhandled(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
-# ---- helpers ----------------------------------------------------------------
+# ---- background pipelines ---------------------------------------------------
 
 
-async def _latest_suggestion(session, analysis_id: str):
-    result = await session.execute(
-        select(models_db.Suggestion)
-        .where(models_db.Suggestion.analysis_id == analysis_id)
-        .order_by(models_db.Suggestion.iteration.desc())
-    )
-    return result.scalars().first()
-
-
-async def _run_analysis_pipeline(analysis_id: str, document_id: str) -> None:
-    """Analyst -> Strategist, emitting events. Never raises to the loop."""
+async def _run_analysis(analysis_id: str, document_id: str) -> None:
     try:
-        await bus.publish("analysis.started", "Analyzing upload", {"analysis_id": analysis_id})
+        await bus.publish("analysis.started", "Reading your brief", {"analysis_id": analysis_id})
         async with SessionLocal() as session:
             doc = await session.get(models_db.Document, document_id)
             if doc is None:
                 await bus.publish("error", "Document missing", {"analysis_id": analysis_id})
                 return
-            analyst_out = await run_analyst(doc.content)
+            brief = await run_analyst(doc.content)
+            await bus.publish(
+                "analysis.done",
+                "Brief parsed",
+                {"analysis_id": analysis_id, "title": brief.title, "project_type": brief.project_type},
+            )
+            questions = await run_clarifier(brief)
             session.add(
                 models_db.Analysis(
                     id=analysis_id,
                     document_id=document_id,
-                    feature_card=analyst_out.feature_card.model_dump(),
-                    brand_card=analyst_out.brand_card.model_dump(),
-                )
-            )
-            await session.commit()
-            await bus.publish(
-                "analysis.done",
-                "Analysis complete",
-                {"analysis_id": analysis_id, "persona": analyst_out.feature_card.persona},
-            )
-
-            smap = await learning.stats_map(session)
-            items = await run_strategist(
-                analyst_out.feature_card,
-                analyst_out.brand_card,
-                smap,
-                learning.top3_lines(smap),
-            )
-            session.add(
-                models_db.Suggestion(
-                    analysis_id=analysis_id, items=_dump_items(items), iteration=0, status="proposed"
+                    brief=brief.model_dump(),
+                    questions=[q.model_dump() for q in questions],
+                    answers=[],
                 )
             )
             await session.commit()
         await bus.publish(
-            "suggestions.ready",
-            "Suggestions ready",
-            {"analysis_id": analysis_id, "iteration": 0, "items": _dump_items(items)},
+            "questions.ready",
+            "A few quick questions",
+            {"analysis_id": analysis_id, "questions": [q.model_dump() for q in questions]},
         )
     except Exception:
         log.exception("analysis pipeline failed")
         await bus.publish("error", "Analysis failed", {"analysis_id": analysis_id})
 
 
-async def _replay_cached(analysis_id: str) -> None:
-    async with SessionLocal() as session:
-        analysis = await session.get(models_db.Analysis, analysis_id)
-        latest = await _latest_suggestion(session, analysis_id)
-    persona = (analysis.feature_card or {}).get("persona") if analysis else None
-    await bus.publish("analysis.done", "Cached analysis", {"analysis_id": analysis_id, "persona": persona})
-    if latest:
+async def _run_generate(
+    spec_id: str,
+    analysis_id: str,
+    answers: list | None,
+    feedback: str,
+    iteration: int,
+) -> None:
+    try:
+        await bus.publish("spec.generating", "Writing your specs", {"analysis_id": analysis_id})
+        async with SessionLocal() as session:
+            analysis = await session.get(models_db.Analysis, analysis_id)
+            if analysis is None:
+                await bus.publish("error", "Analysis missing", {"analysis_id": analysis_id})
+                return
+            if answers is not None:
+                analysis.answers = [a.model_dump() for a in answers]
+                await session.commit()
+            brief = ProjectBrief(**analysis.brief)
+            qa = _qa_pairs(analysis)
+            spec = await run_planner(brief, qa, feedback or "")
+            files = [f.model_dump() for f in specgen.render_files(spec)]
+            session.add(
+                models_db.Spec(id=spec_id, analysis_id=analysis_id, files=files, iteration=iteration)
+            )
+            await session.commit()
         await bus.publish(
-            "suggestions.ready",
-            "Cached suggestions",
-            {"analysis_id": analysis_id, "iteration": latest.iteration, "items": latest.items},
+            "spec.generated",
+            "Specs ready",
+            {
+                "spec_id": spec_id,
+                "iteration": iteration,
+                "title": spec.title,
+                "files": [{"path": f["path"], "mime": f["mime"]} for f in files],
+            },
         )
+    except Exception:
+        log.exception("generate pipeline failed")
+        await bus.publish("error", "Spec generation failed", {"analysis_id": analysis_id})
 
 
 # ---- routes -----------------------------------------------------------------
@@ -189,7 +190,7 @@ async def upload(file: UploadFile = File(...)) -> UploadResp:
         existing = (
             await session.execute(select(models_db.Document).where(models_db.Document.sha256 == sha256))
         ).scalars().first()
-        if existing:  # identical upload -> cache (spec §7.6)
+        if existing:
             return UploadResp(document_id=existing.id)
         doc = models_db.Document(
             safe_name=security.generate_safe_name(file.filename), content=text, sha256=sha256
@@ -207,103 +208,71 @@ async def analyze(request: Request, body: AnalyzeReq) -> AnalyzeResp:
         doc = await session.get(models_db.Document, body.document_id)
         if doc is None:
             raise HTTPException(status_code=404, detail="document not found")
-        existing = (
-            await session.execute(
-                select(models_db.Analysis).where(models_db.Analysis.document_id == doc.id)
-            )
-        ).scalars().first()
-        if existing:  # cached analysis -> replay events, no re-run
-            _spawn(_replay_cached(existing.id))
-            return AnalyzeResp(analysis_id=existing.id)
-
     analysis_id = str(uuid.uuid4())
-    _spawn(_run_analysis_pipeline(analysis_id, body.document_id))
+    _spawn(_run_analysis(analysis_id, body.document_id))
     return AnalyzeResp(analysis_id=analysis_id)
 
 
-@app.post("/refine", response_model=RefineResp)
+@app.post("/generate-specs", response_model=GenerateResp)
 @limiter.limit(settings.rate_limit)
-async def refine(request: Request, body: RefineReq) -> RefineResp:
+async def generate_specs(request: Request, body: GenerateReq) -> GenerateResp:
     async with SessionLocal() as session:
         analysis = await session.get(models_db.Analysis, body.analysis_id)
         if analysis is None:
             raise HTTPException(status_code=404, detail="analysis not found")
-        latest = await _latest_suggestion(session, body.analysis_id)
-        current_iter = latest.iteration if latest else 0
-        if current_iter >= MAX_REFINE_ITERATIONS:
-            raise HTTPException(status_code=409, detail="Refine limit (3) reached")
-        new_iter = current_iter + 1
+    spec_id = str(uuid.uuid4())
+    _spawn(_run_generate(spec_id, body.analysis_id, body.answers, "", 0))
+    return GenerateResp(spec_id=spec_id)
 
-        feature_card = FeatureCard(**analysis.feature_card)
-        brand_card = BrandCard(**analysis.brand_card)
-        smap = await learning.stats_map(session)
-        items = await run_strategist(
-            feature_card, brand_card, smap, learning.top3_lines(smap), feedback=body.feedback
-        )
-        session.add(
-            models_db.Suggestion(
-                analysis_id=body.analysis_id, items=_dump_items(items), iteration=new_iter, status="refined"
+
+@app.post("/refine", response_model=GenerateResp)
+@limiter.limit(settings.rate_limit)
+async def refine(request: Request, body: RefineReq) -> GenerateResp:
+    async with SessionLocal() as session:
+        analysis = await session.get(models_db.Analysis, body.analysis_id)
+        if analysis is None:
+            raise HTTPException(status_code=404, detail="analysis not found")
+        latest = (
+            await session.execute(
+                select(models_db.Spec)
+                .where(models_db.Spec.analysis_id == body.analysis_id)
+                .order_by(models_db.Spec.iteration.desc())
             )
-        )
-        await session.commit()
-
-    await bus.publish(
-        "suggestions.ready",
-        "Refined suggestions",
-        {"analysis_id": body.analysis_id, "iteration": new_iter, "items": _dump_items(items)},
-    )
-    return RefineResp(analysis_id=body.analysis_id, iteration=new_iter)
+        ).scalars().first()
+        iteration = (latest.iteration if latest else 0) + 1
+        if iteration > MAX_SPEC_REVISIONS:
+            raise HTTPException(status_code=409, detail="Revision limit reached")
+    spec_id = str(uuid.uuid4())
+    _spawn(_run_generate(spec_id, body.analysis_id, None, body.feedback, iteration))
+    return GenerateResp(spec_id=spec_id)
 
 
-@app.post("/feedback", status_code=204)
-async def feedback(body: FeedbackReq) -> Response:
-    async with SessionLocal() as session:
-        await learning.record(session, body.strategy_id.value, body.action)
-    return Response(status_code=204)
-
-
-@app.post("/generate-specs", response_model=SpecResp)
-@limiter.limit(settings.rate_limit)
-async def generate_specs(request: Request, body: GenerateSpecsReq) -> SpecResp:
-    async with SessionLocal() as session:
-        analysis = await session.get(models_db.Analysis, body.analysis_id)
-        if analysis is None:
-            raise HTTPException(status_code=404, detail="analysis not found")
-        latest = await _latest_suggestion(session, body.analysis_id)
-        all_items = [Suggestion(**it) for it in (latest.items if latest else [])]
-        approved_set = set(body.approved_ids)
-        approved = [s for s in all_items if s.strategy_id.value in approved_set] or all_items
-
-        feature_card = FeatureCard(**analysis.feature_card)
-        brand_card = BrandCard(**analysis.brand_card)
-        files: list[SpecFile] = await run_specwriter(feature_card, brand_card, approved)
-
-        spec = models_db.Spec(analysis_id=body.analysis_id, files=[f.model_dump() for f in files])
-        session.add(spec)
-        await session.commit()
-        await session.refresh(spec)
-        spec_id = spec.id
-
-    await bus.publish(
-        "spec.generated",
-        "Specs generated",
-        {"spec_id": spec_id, "files": [{"name": f.name, "mime": f.mime} for f in files]},
-    )
-    return SpecResp(spec_id=spec_id, files=files)
-
-
-@app.get("/specs/{spec_id}/{name}")
-async def download_spec(spec_id: str, name: str) -> Response:
+@app.get("/specs/{spec_id}/archive.zip")
+async def download_zip(spec_id: str) -> Response:
     async with SessionLocal() as session:
         spec = await session.get(models_db.Spec, spec_id)
     if spec is None:
         raise HTTPException(status_code=404, detail="spec not found")
-    target = next((f for f in spec.files if f["name"] == name), None)
+    data = specgen.build_zip(spec.files)
+    return Response(
+        content=data,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="specs.zip"'},
+    )
+
+
+@app.get("/specs/{spec_id}/file/{file_path:path}")
+async def download_file(spec_id: str, file_path: str) -> Response:
+    async with SessionLocal() as session:
+        spec = await session.get(models_db.Spec, spec_id)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="spec not found")
+    target = next((f for f in spec.files if f["path"] == file_path), None)
     if target is None:
         raise HTTPException(status_code=404, detail="file not found")
-    safe = security.sanitize_download_name(target["name"])
+    name = security.sanitize_download_name(file_path.split("/")[-1])
     return Response(
         content=target["content"],
         media_type=target["mime"],
-        headers={"Content-Disposition": f'attachment; filename="{safe}"'},
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
     )

@@ -1,105 +1,121 @@
-"""Deterministic text -> FeatureCard (NO LLM).
+"""Deterministic brief -> ProjectBrief (NO LLM).
 
-This is the fallback that keeps the whole product working with the LLM key
-removed. Pure functions: same input always yields the same output.
+Heuristic parse that always produces a usable structured brief. It is the
+fallback for the Analyst agent and keeps the whole flow working with no model key.
+Pure functions: same input always yields the same output.
 """
 from __future__ import annotations
 
 import re
 
-from backend.schemas import BrandCard, FeatureCard, Signals
+from backend.schemas import ProjectBrief
 
-# Occurrences of cue words that push a signal toward ~1.0.
-_NORM = 4.0
+_BULLET = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*\S)\s*$")
+_HEADING = re.compile(r"^\s*#{1,6}\s+(.*\S)\s*$")
 
-_SIGNAL_KEYWORDS: dict[str, list[str]] = {
-    "price_sens": ["discount", "cheap", "price", "deal", "save", "coupon",
-                   "budget", "sale", "%", "affordable"],
-    "loyalty": ["loyal", "member", "reward", "points", "vip", "returning",
-                "subscriber", "repeat", "retention"],
-    "recency": ["today", "this week", "recent", "just", "latest", "now",
-                "yesterday"],
-    "novelty": ["new", "novel", "innovative", "fresh", "launch", "trend",
-                "cutting-edge", "beta"],
-    "engage": ["click", "open", "engage", "share", "comment", "like",
-               "follow", "active", "visit", "session"],
-}
+_TYPE_CUES = [
+    (("cli", "command line", "command-line", "terminal tool"), "cli"),
+    (("rest api", "api service", "backend api", "graphql", "endpoint"), "api"),
+    (("mobile", "ios", "android", "react native", "flutter"), "mobile"),
+    (("dashboard", "web app", "webapp", "website", "saas", "portal", "platform"), "web app"),
+]
 
-_NEW_KEYWORDS = ["new customer", "first-time", "first time", "sign up", "signup",
-                 "welcome", "trial", "just joined", "new user", "prospect"]
+_TECH = [
+    "react", "next.js", "nextjs", "next", "vue", "svelte", "angular", "remix",
+    "fastapi", "flask", "django", "express", "node", "nestjs", "rails",
+    "python", "typescript", "javascript", "go", "rust", "java", "kotlin",
+    "postgres", "postgresql", "mysql", "sqlite", "mongodb", "redis", "supabase",
+    "tailwind", "graphql", "stripe", "auth0", "firebase",
+]
 
-_PERSONA = {
-    "price_sens": "Deal Seeker",
-    "loyalty": "Loyal Advocate",
-    "recency": "Recently Active",
-    "novelty": "Novelty Chaser",
-    "engage": "Highly Engaged",
-}
+_USER_WORDS = [
+    "users", "customers", "admins", "administrators", "students", "teachers",
+    "managers", "teams", "members", "patients", "clients", "sellers", "buyers",
+    "creators", "developers", "guests", "owners", "staff", "subscribers",
+]
 
-_HEX_RE = re.compile(r"#[0-9a-fA-F]{6}\b")
-_TONE_CUES = {
-    "luxury": "premium", "premium": "premium", "playful": "playful",
-    "fun": "playful", "professional": "professional", "bold": "bold",
-    "minimal": "minimal", "friendly": "friendly",
-}
-_RESTRICT_MARKERS = ["avoid:", "do not use:", "don't use:", "banned:",
-                     "restricted:", "never say:", "prohibited:"]
+_FEATURE_HINTS = ("should", "can ", "able to", "allow", "support", "let users", "be able")
+_GOAL_HINTS = ("goal", "objective", "purpose", "aim", "want to", "help ", "so that")
+_NONGOAL_HINTS = ("out of scope", "not ", "won't", "wont", "no need", "exclude", "later")
 
 
-def build_feature_card(text: str) -> FeatureCard:
-    low = text.lower()
-    scores = {
-        sig: round(min(1.0, sum(low.count(k) for k in kws) / _NORM), 2)
-        for sig, kws in _SIGNAL_KEYWORDS.items()
-    }
-    is_new = any(k in low for k in _NEW_KEYWORDS)
-    signals = Signals(is_new=is_new, **scores)
-    return FeatureCard(
-        persona=_persona(scores, is_new),
-        f=signals,
-        tags=_tags(scores, is_new),
-    )
+def _lines(text: str) -> list[str]:
+    return [ln.rstrip() for ln in text.splitlines()]
 
 
-def _persona(scores: dict[str, float], is_new: bool) -> str:
-    if is_new and scores["loyalty"] < 0.3:
-        return "New Prospect"
-    top = max(scores, key=lambda k: scores[k])
-    if scores[top] == 0.0:
-        return "General Audience"
-    return _PERSONA[top]
+def _sentences(text: str) -> list[str]:
+    return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
 
 
-def _tags(scores: dict[str, float], is_new: bool) -> list[str]:
-    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-    tags = [k for k, v in ranked if v >= 0.5][:4]
-    if is_new and len(tags) < 4 and "new" not in tags:
-        tags.append("new")
-    return tags[:4]
+def _title(text: str) -> str:
+    for ln in _lines(text):
+        m = _HEADING.match(ln)
+        if m:
+            return m.group(1)[:80]
+    for ln in _lines(text):
+        if ln.strip():
+            return ln.strip()[:80]
+    return "Untitled Project"
 
 
-def extract_brand_card_defaults(text: str) -> BrandCard:
-    """Deterministic baseline brand card; the LLM Analyst refines it later."""
-    low = text.lower()
-    palette = list(dict.fromkeys(_HEX_RE.findall(text)))[:5]
-    tone = "friendly-professional"
-    for cue, mapped in _TONE_CUES.items():
-        if cue in low:
-            tone = mapped
-            break
-    return BrandCard(tone=tone, palette=palette, restricted_keywords=_restricted(text))
+def _summary(text: str) -> str:
+    body = "\n".join(ln for ln in _lines(text) if not _HEADING.match(ln)).strip()
+    sents = _sentences(body)
+    return " ".join(sents[:2])[:300] if sents else body[:300]
 
 
-def _restricted(text: str) -> list[str]:
-    out: list[str] = []
-    for line in text.splitlines():
-        ll = line.lower()
-        for marker in _RESTRICT_MARKERS:
-            if marker in ll:
-                tail = line[ll.index(marker) + len(marker):]
-                out += [w.strip().strip(".") for w in re.split(r"[,;]", tail) if w.strip()]
+def _bullets(text: str) -> list[str]:
+    return [m.group(1) for ln in _lines(text) if (m := _BULLET.match(ln))]
+
+
+def _dedupe(items: list[str], cap: int) -> list[str]:
     seen: list[str] = []
-    for w in out:
-        if w and w.lower() not in {s.lower() for s in seen}:
-            seen.append(w)
-    return seen[:10]
+    for it in items:
+        norm = it.strip()
+        if norm and norm.lower() not in {s.lower() for s in seen}:
+            seen.append(norm)
+        if len(seen) >= cap:
+            break
+    return seen
+
+
+def build_project_brief(text: str) -> ProjectBrief:
+    low = text.lower()
+    bullets = _bullets(text)
+    sents = _sentences(text)
+
+    project_type = "web app"
+    for cues, label in _TYPE_CUES:
+        if any(c in low for c in cues):
+            project_type = label
+            break
+
+    features = _dedupe(
+        bullets or [s for s in sents if any(h in s.lower() for h in _FEATURE_HINTS)],
+        8,
+    )
+    goals = _dedupe([s for s in sents if any(h in s.lower() for h in _GOAL_HINTS)], 4)
+    non_goals = _dedupe([s for s in sents if any(h in s.lower() for h in _NONGOAL_HINTS)], 4)
+    users = _dedupe([w.capitalize() for w in _USER_WORDS if w in low], 6)
+    tech = _dedupe([t for t in _TECH if t in low], 8)
+
+    open_areas: list[str] = []
+    if not users:
+        open_areas.append("target users / audience")
+    if not features:
+        open_areas.append("must-have features for v1")
+    if not tech:
+        open_areas.append("preferred tech stack")
+    open_areas += ["data & storage", "explicit out-of-scope for v1"]
+
+    return ProjectBrief(
+        title=_title(text),
+        summary=_summary(text) or "A software project.",
+        project_type=project_type,
+        goals=goals or ([sents[0]] if sents else []),
+        non_goals=non_goals,
+        users=users,
+        features=features,
+        tech=tech,
+        open_areas=_dedupe(open_areas, 6),
+    )

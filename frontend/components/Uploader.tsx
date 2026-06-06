@@ -56,10 +56,11 @@ export function Uploader({
             </span>
           </div>
           <h1 className="text-headline-lg mb-1 text-primary">
-            Turn a brief into a marketing spec
+            Turn a rough idea into a full spec
           </h1>
           <p className="text-body-lg text-on-surface-variant">
-            Paste your brand brief and audience data, or upload a .txt / .md file.
+            Describe your app idea, or upload a .txt / .md brief. We&apos;ll ask a few
+            questions, then generate a downloadable spec package.
           </p>
         </div>
 

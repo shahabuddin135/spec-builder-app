@@ -10,11 +10,12 @@ export interface AppEvent {
   data?: Record<string, unknown>;
 }
 
-// Named events the backend emits (CONTRACT.md > events).
+// Named events the backend emits.
 const EVENT_TYPES = [
   "analysis.started",
   "analysis.done",
-  "suggestions.ready",
+  "questions.ready",
+  "spec.generating",
   "spec.generated",
   "error",
 ];

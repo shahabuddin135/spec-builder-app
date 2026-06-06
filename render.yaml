@@ -1,0 +1,23 @@
+# Render deploy for the SpecForge backend.
+# Python is pinned to 3.12 because litellm requires >=3.10,<3.14 (Render's default
+# can be 3.14, which has no matching litellm/asyncpg wheels).
+services:
+  - type: web
+    name: specforge-backend
+    runtime: python
+    rootDir: .
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      - key: RATE_LIMIT
+        value: 20/minute
+      - key: ALLOWED_ORIGIN
+        sync: false   # set to the exact Vercel URL
+      - key: DATABASE_URL
+        sync: false   # Neon URL with ?sslmode=require
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false

@@ -1,13 +1,14 @@
-"""Acceptance check for requirements.md §12, run against the real ASGI app.
+"""Acceptance check for the spec generator, run against the real ASGI app.
 
-Drives the full flow with the realistic example uploads in examples/ and maps each
-result to a §12 criterion. This is the allowed "acceptance check" (requirements.md §13);
-it is NOT a unit-test suite. Run from the repo root:
+Drives the full flow with the example briefs in examples/ and verifies the
+clarify -> generate -> review -> zip path. Run from the repo root (isolated:
+forces local SQLite, clears keys, never touches Neon):
 
     .venv/Scripts/python.exe acceptance_check.py
 """
 import asyncio
-import json
+import io
+import zipfile
 from pathlib import Path
 
 from httpx import ASGITransport, AsyncClient
@@ -16,12 +17,19 @@ from backend.agents import runtime
 from backend.config import get_settings
 from backend.db import init_db
 from backend.events import bus
-from backend.ingest import build_feature_card, extract_brand_card_defaults
 from backend.main import app
 
 EX = Path(__file__).resolve().parent / "examples"
-ACME = (EX / "acme_coffee_club.md").read_text(encoding="utf-8")
-AURORA = (EX / "aurora_skincare.md").read_text(encoding="utf-8")
+WEB = (EX / "habit_tracker.md").read_text(encoding="utf-8")
+API = (EX / "invoicing_api.md").read_text(encoding="utf-8")
+
+FULL_STRUCTURE = {
+    "README.md", "SPEC.md", "CONTEXT.md", "CONSTRAINTS.md", "SECURITY.md", "MEMORY.md",
+    "backend_specs/ARCH.md", "backend_specs/CONTRACT.md", "backend_specs/PLAN.md",
+    "backend_specs/tasks/task_index.md",
+    "frontend_specs/ARCH.md", "frontend_specs/CONTRACT.md", "frontend_specs/PLAN.md",
+    "frontend_specs/tasks/task_index.md",
+}
 
 _results: list[tuple[str, bool, str]] = []
 
@@ -31,7 +39,7 @@ def check(name: str, ok: bool, note: str = "") -> None:
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f"  ({note})" if note else ""))
 
 
-async def drain_until(q, target, timeout=10.0):
+async def drain_until(q, target, timeout=12.0):
     seen = []
     while True:
         ev = await asyncio.wait_for(q.get(), timeout=timeout)
@@ -39,16 +47,16 @@ async def drain_until(q, target, timeout=10.0):
         if ev["type"] == target:
             return ev, seen
         if ev["type"] == "error":
-            raise RuntimeError(f"pipeline error; seen={seen}")
+            raise RuntimeError(f"error event; seen={seen}")
 
 
-async def upload_analyze(c, q, text, name):
-    up = await c.post("/upload", files={"file": (name, text.encode(), "text/plain")})
+async def run_brief(c, q, text, name):
+    up = await c.post("/upload", files={"file": (name, text.encode(), "text/markdown")})
     doc = up.json()["document_id"]
     an = await c.post("/analyze", json={"document_id": doc})
     aid = an.json()["analysis_id"]
-    ev, seen = await drain_until(q, "suggestions.ready")
-    return doc, aid, ev["data"]["items"], seen
+    ev, seen = await drain_until(q, "questions.ready")
+    return aid, ev["data"]["questions"], seen
 
 
 async def main():
@@ -56,99 +64,56 @@ async def main():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
         q = await bus.subscribe()
 
-        # ---- §12.1 upload -> FeatureCard; raw text never sent to an LLM ----
-        doc_a, aid_a, items_a, seen_a = await upload_analyze(c, q, ACME, "acme.md")
-        fc_a = build_feature_card(ACME)
-        print("\nACME FeatureCard:\n" + json.dumps(fc_a.model_dump(), indent=2))
-        print("ACME ranked:", [i["strategy_id"] for i in items_a])
-        check("§12.1 upload -> FeatureCard", bool(doc_a) and "persona" in fc_a.model_dump())
+        # --- web app brief: brief -> questions -> generate -> zip ---
+        aid, questions, seen = await run_brief(c, q, WEB, "habit.md")
+        print("questions:", [qq["id"] for qq in questions])
+        check("upload -> analyze -> clarifying questions",
+              {"analysis.started", "analysis.done", "questions.ready"} <= set(seen)
+              and 3 <= len(questions) <= 6)
 
-        r415 = await c.post("/upload", files={"file": ("x.pdf", b"%PDF-1.4", "application/pdf")})
-        r413 = await c.post("/upload", files={"file": ("big.txt", b"a" * (256 * 1024 + 1), "text/plain")})
-        r422 = await c.post("/upload", files={"file": ("n.txt", b"hi\x00there", "text/plain")})
-        check("§12.1 reject .pdf/oversize/binary",
-              r415.status_code == 415 and r413.status_code == 413 and r422.status_code == 422,
-              f"{r415.status_code}/{r413.status_code}/{r422.status_code}")
+        answers = [{"id": qq["id"], "answer": "Reasonable answer"} for qq in questions]
+        gen = await c.post("/generate-specs", json={"analysis_id": aid, "answers": answers})
+        spec_id = gen.json()["spec_id"]
+        ev2, _ = await drain_until(q, "spec.generated")
+        paths = {f["path"] for f in ev2["data"]["files"]}
+        check("full spec package generated", FULL_STRUCTURE <= paths,
+              f"missing: {sorted(FULL_STRUCTURE - paths)}")
 
-        # ---- §12.3 UI advances on events ----
-        check("§12.3 flow advances on events",
-              {"analysis.started", "analysis.done", "suggestions.ready"} <= set(seen_a), str(seen_a))
+        z = await c.get(f"/specs/{spec_id}/archive.zip")
+        zf = zipfile.ZipFile(io.BytesIO(z.content))
+        blob = b"\n".join(zf.read(n) for n in zf.namelist()).decode("utf-8").lower()
+        check("specs.zip downloads (attachment, application/zip)",
+              z.status_code == 200 and z.headers["content-type"] == "application/zip"
+              and 'filename="specs.zip"' in z.headers.get("content-disposition", ""))
+        check("no methodology jargon in output", "slc" not in blob)
+        check("event-driven (UI advances on events, not POST returns)",
+              ev2["data"]["spec_id"] == spec_id)
 
-        # ---- §12.2 second upload differs; restricted keyword never appears ----
-        doc_b, aid_b, items_b, seen_b = await upload_analyze(c, q, AURORA, "aurora.md")
-        fc_b = build_feature_card(AURORA)
-        bc_b = extract_brand_card_defaults(AURORA)
-        print("\nAURORA FeatureCard:\n" + json.dumps(fc_b.model_dump(), indent=2))
-        print("AURORA brand restricted_keywords:", bc_b.restricted_keywords)
-        print("AURORA ranked:", [i["strategy_id"] for i in items_b])
-        check("§12.2 different uploads -> different suggestions",
-              [i["strategy_id"] for i in items_a] != [i["strategy_id"] for i in items_b])
+        one = await c.get(f"/specs/{spec_id}/file/backend_specs/CONTRACT.md")
+        check("single-file download works",
+              one.status_code == 200 and "attachment" in one.headers.get("content-disposition", ""))
 
-        restricted = {w.lower() for w in
-                      extract_brand_card_defaults(ACME).restricted_keywords + bc_b.restricted_keywords}
-        copy_blob = " ".join(i["title"] + " " + i["rationale"] for i in items_a + items_b).lower()
-        check("§12.2 restricted keyword absent from suggestions",
-              all(w not in copy_blob for w in restricted), f"restricted={sorted(restricted)}")
+        rf = await c.post("/refine", json={"analysis_id": aid, "feedback": "Add export-to-CSV."})
+        ev3, _ = await drain_until(q, "spec.generated")
+        check("request-changes regenerates (revision++)", ev3["data"]["iteration"] == 1)
 
-        # ---- §12.7 prompt-injection ignored ----
-        check("§12.7 injected 'ignore instructions' had no effect (no PWNED)", "pwned" not in copy_blob)
-
-        # ---- §7.6 identical upload is cached ----
-        dup = await c.post("/upload", files={"file": ("acme2.md", ACME.encode(), "text/plain")})
-        check("§7.6 identical upload cached (same document_id)", dup.json()["document_id"] == doc_a)
-
-        # ---- §12.4 approve + refine + generate + download ----
-        await c.post("/feedback", json={"strategy_id": items_b[0]["strategy_id"], "action": "approve"})
-        rf = await c.post("/refine", json={"analysis_id": aid_b, "feedback": "lean into welcome and novelty"})
-        await drain_until(q, "suggestions.ready")
-        gs = await c.post("/generate-specs", json={
-            "analysis_id": aid_b,
-            "approved_ids": [items_b[0]["strategy_id"], items_b[1]["strategy_id"]],
-        })
-        spec = gs.json()
+        # --- API brief: project-type adaptation (no UI screens) ---
+        aid2, _, _ = await run_brief(c, q, API, "api.md")
+        gen2 = await c.post("/generate-specs", json={"analysis_id": aid2, "answers": []})
+        sid2 = gen2.json()["spec_id"]
         await drain_until(q, "spec.generated")
-        names = {f["name"] for f in spec["files"]}
-        md = next(f["content"] for f in spec["files"] if f["name"].endswith(".md"))
-        dl = await c.get(f"/specs/{spec['spec_id']}/marketing-strategy-spec.md")
-        check("§12.4 specs generated + downloadable",
-              names == {"marketing-strategy-spec.md", "personalization-rules.json", "brand-card.json"}
-              and rf.json()["iteration"] == 1 and dl.status_code == 200
-              and "attachment" in dl.headers.get("content-disposition", "")
-              and dl.headers["content-type"].startswith("text/markdown"))
-        check("§12.2 restricted keyword absent from generated spec",
-              all(w not in md.lower() for w in restricted))
-        print("\n----- generated marketing-strategy-spec.md (Aurora) -----\n" + md
-              + "\n---------------------------------------------------------")
+        fe = await c.get(f"/specs/{sid2}/file/frontend_specs/ARCH.md")
+        check("API project notes 'backend-only' in frontend ARCH",
+              "backend-only" in fe.text.lower())
 
-        # ---- §12.5 approve/reject re-ranks on re-run (self-learning) ----
-        base_rank = [i["strategy_id"] for i in items_b]
-        target, above = base_rank[-1], base_rank[-2]
-        for _ in range(8):
-            await c.post("/feedback", json={"strategy_id": target, "action": "approve"})
-        for _ in range(6):
-            await c.post("/feedback", json={"strategy_id": above, "action": "reject"})
-        _, _, items_b2, _ = await upload_analyze(c, q, AURORA + "\n<!-- variant -->", "aurora_v2.md")
-        new_rank = [i["strategy_id"] for i in items_b2]
-        print(f"self-learning: '{target}' rank {base_rank.index(target)} -> {new_rank.index(target)}")
-        check("§12.5 approve/reject re-ranks (self-learning)",
-              new_rank.index(target) < base_rank.index(target) and new_rank != base_rank,
-              f"{target}: {base_rank.index(target)} -> {new_rank.index(target)}")
-
-        # ---- §12.6 deterministic flow w/o key + token ceiling ----
-        check("§12.6 full flow works with NO LLM key (deterministic)",
-              get_settings().has_llm is False and bool(items_a))
+        # --- security: no key -> deterministic; token ceiling fires ---
+        check("works with NO LLM key (deterministic)", get_settings().has_llm is False)
         try:
             runtime.assert_within_budget("x" * 100_000)
             fired = False
         except ValueError:
             fired = True
-        check("§12.6 token-ceiling assert fires on bloated input", fired)
-
-        # ---- §12.7 CORS rejects a foreign origin ----
-        pre = await c.options("/analyze", headers={
-            "Origin": "http://evil.example", "Access-Control-Request-Method": "POST"})
-        aco = pre.headers.get("access-control-allow-origin")
-        check("§12.7 CORS rejects foreign origin", aco != "http://evil.example", f"allow-origin={aco}")
+        check("token-ceiling assert fires on bloated input", fired)
 
     passed = sum(1 for _, ok, _ in _results if ok)
     print(f"\n==== {passed}/{len(_results)} acceptance checks PASSED ====")

@@ -1,106 +1,93 @@
-"""Pydantic request/response + agent I/O schemas (mirror CONTRACT.md exactly)."""
-from __future__ import annotations
+"""Pydantic schemas for the spec generator + reviewer.
 
-from typing import Literal
+Flow: brief -> ProjectBrief (parsed) -> Question[] (clarify) -> ProjectSpec
+(enriched, after answers) -> SpecFile[] (rendered package) -> specs.zip.
+
+Agent-facing models are tolerant (plain types, defaults, no enums/limits) so the
+provider never rejects the model's own output; we normalize in app code.
+"""
+from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from backend.strategies import StrategyId
-
-# ---- Agent I/O (the compact shapes that flow between agents) ----------------
+# ---- Parsed understanding of the brief --------------------------------------
 
 
-class Signals(BaseModel):
-    price_sens: float = Field(ge=0.0, le=1.0)
-    loyalty: float = Field(ge=0.0, le=1.0)
-    recency: float = Field(ge=0.0, le=1.0)
-    novelty: float = Field(ge=0.0, le=1.0)
-    engage: float = Field(ge=0.0, le=1.0)
-    is_new: bool
+class ProjectBrief(BaseModel):
+    title: str = "Untitled Project"
+    summary: str = ""
+    project_type: str = "web app"          # web app | api | cli | mobile | ...
+    goals: list[str] = Field(default_factory=list)
+    non_goals: list[str] = Field(default_factory=list)
+    users: list[str] = Field(default_factory=list)
+    features: list[str] = Field(default_factory=list)
+    tech: list[str] = Field(default_factory=list)
+    open_areas: list[str] = Field(default_factory=list)  # what's vague -> drives questions
 
 
-class FeatureCard(BaseModel):
-    """The ONLY user representation any agent sees (~40 tokens)."""
-
-    persona: str
-    f: Signals
-    tags: list[str] = Field(default_factory=list, max_length=4)
-
-
-class BrandCard(BaseModel):
-    tone: str
-    palette: list[str] = Field(default_factory=list)
-    restricted_keywords: list[str] = Field(default_factory=list)
+class Question(BaseModel):
+    id: str
+    question: str
+    why: str = ""
+    suggestions: list[str] = Field(default_factory=list)
 
 
-class Suggestion(BaseModel):
-    strategy_id: StrategyId               # enum-constrained to the live library
-    title: str
-    rationale: str = Field(max_length=160)
-    target_signal: str
-    on_brand: bool = True
+class QuestionsOut(BaseModel):
+    questions: list[Question] = Field(default_factory=list)
 
 
-class AnalystOut(BaseModel):
-    feature_card: FeatureCard
-    brand_card: BrandCard
+# ---- Enriched, render-ready spec --------------------------------------------
 
 
-class StrategistOut(BaseModel):
-    suggestions: list[Suggestion]         # ranked
+class Entity(BaseModel):
+    name: str
+    fields: list[str] = Field(default_factory=list)
 
 
-# ---- LLM-facing (tolerant) schemas ------------------------------------------
-# Models derive their tool/JSON schema from these, so they carry NO constraints
-# (no enum, range, or length) — that way the provider never rejects the model's
-# own output. We clamp/threshold/enum-validate/truncate in app code after parsing.
+class Endpoint(BaseModel):
+    method: str = "GET"
+    path: str = "/"
+    purpose: str = ""
 
 
-class LLMSignals(BaseModel):
-    price_sens: float = 0.0
-    loyalty: float = 0.0
-    recency: float = 0.0
-    novelty: float = 0.0
-    engage: float = 0.0
-    is_new: float = 0.0                   # model emits a score; we threshold to bool
+class Phase(BaseModel):
+    name: str
+    tasks: list[str] = Field(default_factory=list)
 
 
-class LLMFeatureCard(BaseModel):
-    persona: str
-    f: LLMSignals
-    tags: list[str] = Field(default_factory=list)
+class ProjectSpec(BaseModel):
+    title: str = "Untitled Project"
+    summary: str = ""
+    project_type: str = "web app"
+    goal: str = ""
+    non_goals: list[str] = Field(default_factory=list)
+    users: list[str] = Field(default_factory=list)
+    features: list[str] = Field(default_factory=list)
+    entities: list[Entity] = Field(default_factory=list)
+    backend_modules: list[str] = Field(default_factory=list)
+    backend_endpoints: list[Endpoint] = Field(default_factory=list)
+    frontend_screens: list[str] = Field(default_factory=list)
+    frontend_state: list[str] = Field(default_factory=list)
+    tech: list[str] = Field(default_factory=list)
+    scale: list[str] = Field(default_factory=list)
+    hard_rules: list[str] = Field(default_factory=list)
+    security: list[str] = Field(default_factory=list)
+    phases: list[Phase] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
 
 
-class LLMBrandCard(BaseModel):
-    tone: str = "neutral"
-    palette: list[str] = Field(default_factory=list)
-    restricted_keywords: list[str] = Field(default_factory=list)
-
-
-class AnalystLLMOut(BaseModel):
-    feature_card: LLMFeatureCard
-    brand_card: LLMBrandCard
-
-
-class LLMSuggestion(BaseModel):
-    strategy_id: str                      # plain str -> invalid ids are dropped, not rejected
-    title: str
-    rationale: str
-    target_signal: str = ""
-
-
-class StrategistLLMOut(BaseModel):
-    suggestions: list[LLMSuggestion]
-
-
-class MarkdownOut(BaseModel):
-    markdown: str
+# ---- Rendered output --------------------------------------------------------
 
 
 class SpecFile(BaseModel):
-    name: str
-    mime: str
+    path: str            # e.g. "backend_specs/ARCH.md"
+    mime: str = "text/markdown"
     content: str
+
+
+class SpecFileMeta(BaseModel):
+    path: str
+    mime: str = "text/markdown"
 
 
 # ---- HTTP request bodies ----------------------------------------------------
@@ -110,19 +97,19 @@ class AnalyzeReq(BaseModel):
     document_id: str
 
 
+class AnswerItem(BaseModel):
+    id: str
+    answer: str = ""
+
+
+class GenerateReq(BaseModel):
+    analysis_id: str
+    answers: list[AnswerItem] = Field(default_factory=list)
+
+
 class RefineReq(BaseModel):
     analysis_id: str
-    feedback: str = Field(max_length=2000)
-
-
-class FeedbackReq(BaseModel):
-    strategy_id: StrategyId
-    action: Literal["approve", "reject"]
-
-
-class GenerateSpecsReq(BaseModel):
-    analysis_id: str
-    approved_ids: list[str] = Field(default_factory=list)
+    feedback: str = Field(default="", max_length=2000)
 
 
 # ---- HTTP responses ---------------------------------------------------------
@@ -136,11 +123,11 @@ class AnalyzeResp(BaseModel):
     analysis_id: str
 
 
-class RefineResp(BaseModel):
-    analysis_id: str
-    iteration: int
+class GenerateResp(BaseModel):
+    spec_id: str
 
 
 class SpecResp(BaseModel):
     spec_id: str
-    files: list[SpecFile]
+    iteration: int
+    files: list[SpecFileMeta]

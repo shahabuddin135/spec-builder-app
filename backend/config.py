@@ -12,11 +12,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ---- Constants (DO NOT CHANGE without a MEMORY.md entry) --------------------
 MAX_AGENT_INPUT_TOKENS = 800          # runtime.py estimates len//4 and RAISES if exceeded
-MAX_OUTPUT_TOKENS = 256               # agent outputs are small JSON
+MAX_OUTPUT_TOKENS = 256               # small JSON outputs (parse, clarifying questions)
+SPEC_MAX_OUTPUT_TOKENS = 3000         # larger budget for the enriched spec object
 MAX_UPLOAD_BYTES = 256 * 1024         # 256 KB upload ceiling
-MAX_REFINE_ITERATIONS = 3             # /refine is bounded
-LLM_TIMEOUT_SECONDS = 30              # hard ceiling on a single model call (anti-hang)
-ANALYST_INPUT_CHARS = 1800            # bounded upload excerpt sent to the Analyst (<=800 tokens)
+MAX_SPEC_REVISIONS = 6                # soft cap on regenerate / request-changes rounds
+LLM_TIMEOUT_SECONDS = 45              # hard ceiling on a single model call (anti-hang)
+BRIEF_INPUT_CHARS = 1800              # bounded brief excerpt sent to agents (<=800 tokens)
 ALLOWED_EXTENSIONS = {".txt", ".md"}
 # Browsers/curl are inconsistent for .md; octet-stream/empty are tolerated only
 # when the extension already passed. application/pdf and friends are rejected.
