@@ -1,0 +1,11 @@
+{
+  "strategies": [
+    { "id": "loyalty",  "desc": "Reward repeat customers to deepen retention and lifetime value.", "brand_fit": 0.90 },
+    { "id": "discount", "desc": "Time-bound price cut to convert price-sensitive buyers.",          "brand_fit": 0.55 },
+    { "id": "social",   "desc": "Leverage social proof and community sharing to expand reach.",      "brand_fit": 0.85 },
+    { "id": "urgency",  "desc": "Scarcity and deadlines to drive immediate action.",                 "brand_fit": 0.70 },
+    { "id": "welcome",  "desc": "Onboard new prospects with a warm first-touch sequence.",           "brand_fit": 0.90 },
+    { "id": "winback",  "desc": "Re-engage lapsed or inactive users with a tailored nudge.",         "brand_fit": 0.80 },
+    { "id": "novelty",  "desc": "Highlight new or innovative offerings to novelty-seekers.",         "brand_fit": 0.80 }
+  ]
+}

@@ -1,0 +1,23 @@
+# Pinned for the PoC. Versions verified against PyPI on 2026-06-06.
+# Re-verify framework APIs via Context7 MCP before implementing integrations.
+
+# --- Web framework ---
+fastapi==0.136.3
+uvicorn[standard]==0.49.0
+python-multipart==0.0.32
+slowapi==0.1.9
+
+# --- Validation / settings ---
+pydantic==2.13.4
+pydantic-settings==2.14.1
+
+# --- Database (SQLAlchemy 2.0 async) ---
+sqlalchemy[asyncio]==2.0.50
+greenlet==3.5.1
+asyncpg==0.31.0        # Neon Postgres (production)
+aiosqlite==0.20.0      # local-dev / no-Neon degrade path
+
+# --- Agents + model gateway (Phase 3) ---
+litellm==1.87.1
+openai-agents==0.17.4
+httpx==0.28.1
