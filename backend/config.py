@@ -12,8 +12,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # ---- Constants (DO NOT CHANGE without a MEMORY.md entry) --------------------
 MAX_AGENT_INPUT_TOKENS = 800          # runtime.py estimates len//4 and RAISES if exceeded
-MAX_OUTPUT_TOKENS = 256               # small JSON outputs (parse, clarifying questions)
-SPEC_MAX_OUTPUT_TOKENS = 3000         # larger budget for the enriched spec object
+MAX_OUTPUT_TOKENS = 1024              # parse output (ProjectBrief)
+QUESTIONS_MAX_OUTPUT_TOKENS = 1500    # clarifying questions (5 items + suggestions)
+SPEC_MAX_OUTPUT_TOKENS = 4000         # enriched spec object (nested, larger)
 MAX_UPLOAD_BYTES = 256 * 1024         # 256 KB upload ceiling
 MAX_SPEC_REVISIONS = 6                # soft cap on regenerate / request-changes rounds
 LLM_TIMEOUT_SECONDS = 45              # hard ceiling on a single model call (anti-hang)

@@ -117,9 +117,13 @@ async def _run_analysis(analysis_id: str, document_id: str) -> None:
             "A few quick questions",
             {"analysis_id": analysis_id, "questions": [q.model_dump() for q in questions]},
         )
-    except Exception:
+    except Exception as exc:
         log.exception("analysis pipeline failed")
-        await bus.publish("error", "Analysis failed", {"analysis_id": analysis_id})
+        await bus.publish(
+            "error",
+            f"Analysis failed: {type(exc).__name__}",
+            {"analysis_id": analysis_id, "detail": str(exc)[:300]},
+        )
 
 
 async def _run_generate(
@@ -157,9 +161,13 @@ async def _run_generate(
                 "files": [{"path": f["path"], "mime": f["mime"]} for f in files],
             },
         )
-    except Exception:
+    except Exception as exc:
         log.exception("generate pipeline failed")
-        await bus.publish("error", "Spec generation failed", {"analysis_id": analysis_id})
+        await bus.publish(
+            "error",
+            f"Spec generation failed: {type(exc).__name__}",
+            {"analysis_id": analysis_id, "detail": str(exc)[:300]},
+        )
 
 
 # ---- routes -----------------------------------------------------------------

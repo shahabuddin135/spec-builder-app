@@ -71,8 +71,14 @@ async def run_structured(
         return None
 
     try:
+        import litellm
         from agents import Agent, ModelSettings, Runner
         from agents.extensions.models.litellm_model import LitellmModel
+
+        # Fail fast: no internal retry/backoff (that turned a rate-limited call into a
+        # ~50s hang), and drop params a given model doesn't support.
+        litellm.num_retries = 0
+        litellm.drop_params = True
     except Exception as exc:  # SDK/extra not installed
         log.warning("Agents SDK unavailable, using fallback: %s", exc)
         return None

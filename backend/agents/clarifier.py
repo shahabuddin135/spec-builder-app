@@ -6,7 +6,7 @@ a sensible default set keyed off the brief's open_areas.
 from __future__ import annotations
 
 from backend.agents import runtime
-from backend.config import get_settings
+from backend.config import QUESTIONS_MAX_OUTPUT_TOKENS, get_settings
 from backend.schemas import ProjectBrief, Question, QuestionsOut
 
 _SYS = (
@@ -93,7 +93,9 @@ async def run_clarifier(brief: ProjectBrief) -> list[Question]:
     if not get_settings().has_llm:
         return fallback
     try:
-        out = await runtime.run_structured(_SYS, _compact(brief), QuestionsOut)
+        out = await runtime.run_structured(
+            _SYS, _compact(brief), QuestionsOut, QUESTIONS_MAX_OUTPUT_TOKENS
+        )
     except Exception:
         out = None
     if not out or not out.questions:
